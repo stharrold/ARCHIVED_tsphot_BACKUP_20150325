@@ -10,20 +10,27 @@ ftp://ftp.princetoninstruments.com/public/Manuals/Princeton%20Instruments/Experi
 
 Note: Use with SPE 3.0. Not backwards compatible with SPE 2.X.
 """
-# TODO: make test modules with test_yes/no_footer.spe files
+# TODO: make pytest modules with test_yes/no_footer.spe files
+# TODO: fix docstrings to match numpy style: https://github.com/numpy/numpy/blob/master/doc/example.py
+# TODO: remove pandas dependency. use builtin csv module.
+# TODO: Use logging levels (and warnings.warn) instead of print.
 
-from __future__ import print_function
-from __future__ import division
+
+from __future__ import absolute_import, division, print_function
 import argparse
+import copy
 import os
 import sys
+import StringIO
 import numpy as np
 import pandas as pd
+
 
 class File(object):
     """
     Handle an SPE file.
     """
+    # TODO: Don't use protected keyword 'file' as class name.
     # Class-wide variables.
     _bits_per_byte = 8
     # TODO: don't hardcode number of metadata, get from user or footer if it exists
@@ -62,7 +69,6 @@ class File(object):
         self._load_header_metadata()
         self._load_footer_metadata()
         self.current_frame_idx = 0
-        return None
 
     # TODO: make __del__ method to close file automatically.
 
@@ -71,12 +77,12 @@ class File(object):
         Check that the file exists and is .spe.
         """
         if not os.path.isfile(self._fname):
-            raise IOError(("File does not exist: {fname}").format(fname=self._fname))
+            raise IOError("File does not exist: {fname}".format(fname=self._fname))
         (fbase, fext) = os.path.splitext(self._fname)
         if fext != '.spe':
-            raise IOError(("File extension not '.spe': {fname}").format(fname=self._fname))
+            raise IOError("File extension not '.spe': {fname}".format(fname=self._fname))
         return None
-    
+
     def _read_at(self, offset, size, ntype):
         """
         Seek to offset byte position then read size number of bytes in ntype format from file.
@@ -96,35 +102,35 @@ class File(object):
         ftp://ftp.princetoninstruments.com/Public/Manuals/Princeton%20Instruments/
         SPE%203.0%20File%20Format%20Specification.pdf
         """
+        # TODO: don't remake temp file every time header metadata is needed.
         # file_header_ver and xml_footer_offset are
         # the only required header fields for SPE 3.0.
         # Header information from SPE 3.0 File Specification, Appendix A.
-        # Read in CSV of header format without comments.
+        # Remove comments from header CSV.
         ffmt = os.path.join(os.path.dirname(__file__), 'spe_30_header_format.csv')
         ffmt_base, ext = os.path.splitext(ffmt)
-        ffmt_nocmts = ffmt_base + '_temp' + ext
         if not os.path.isfile(ffmt):
             raise IOError("SPE 3.0 header format file does not exist: {fname}".format(fname=ffmt))
         if ext != '.csv':
             raise TypeError("SPE 3.0 header format file is not .csv: {fname}".format(fname=ffmt))
-        with open(ffmt) as fcmts:
-            # Make a temporary file without comments.
-            with open(ffmt_nocmts, 'w') as fnocmts:
-                for line in fcmts:
-                    if line.startswith('#'):
-                        continue
-                    else:
-                        fnocmts.write(line)
-        self.header_metadata = pd.read_csv(ffmt_nocmts, sep=',')
-        os.remove(ffmt_nocmts)
+        with open(ffmt, 'rb') as fcmts:
+            header_cmts = fcmts.readlines()
+        header_nocmts = []
+        for line in header_cmts:
+            if line.startswith('#'):
+                continue
+            else:
+                header_nocmts.append(line)
+        header_nocmts_str = StringIO.StringIO(''.join(header_nocmts))
+        self.header_metadata = pd.read_csv(header_nocmts_str, sep=',')
         # TODO: Efficiently read values and create column following
         # http://pandas.pydata.org/pandas-docs/version/0.13.1/cookbook.html
         # Index values by offset byte position.
         offset_to_value = {}
         for idx in xrange(len(self.header_metadata)):
-            offset = self.header_metadata["Offset"][idx]
+            offset = int(self.header_metadata["Offset"][idx])
             try:
-                size = (self.header_metadata["Offset"][idx+1]
+                size = (self.header_metadata["Offset"][idx + 1]
                         - self.header_metadata["Offset"][idx]
                         - 1)
             # Key error if at last value in the header
@@ -146,9 +152,9 @@ class File(object):
         version = self.header_metadata[tf_mask]["Value"].values[0]
         if version != 3:
             print(("WARNING: File is not SPE version 3.\n"
-                   +" SPE version: {ver}").format(ver=version), file=sys.stderr)
+                   + " SPE version: {ver}").format(ver=version), file=sys.stderr)
         return None
-    
+
     def _load_footer_metadata(self):
         """
         Load SPE metadata from XML footer as a string
@@ -157,15 +163,32 @@ class File(object):
         since XML footer is more complete.
         """
         tf_mask = (self.header_metadata["Type_Name"] == "XMLOffset")
-        xml_offset = self.header_metadata[tf_mask]["Value"].values[0]
+        xml_offset = int(self.header_metadata[tf_mask]["Value"].values[0])
         if xml_offset == 0:
             print(("INFO: XML footer metadata is empty for:\n"
-                  +" {fname}").format(fname=self._fname))
+                   + " {fname}").format(fname=self._fname))
         else:
-            self._fid.seek(xml_offset)
             # All XML footer metadata is contained within one line.
-            self.footer_metadata = self._fid.read()
+            # Strip anything before '<SpeFormat' or after 'SpeFormat>'
+            # The byte offset for the start of the XML file can be off if the file
+            # is not begun/ended correctly. Search for the beginning of the XML
+            # footer 1KB before the byte offset and trim the excess.
+            self._fid.seek(xml_offset - 1024)
+            xml_orig = self._fid.read()
+            xml_trim = copy.copy(xml_orig)
+            pieces = xml_trim.partition('<SpeFormat')
+            xml_trim = ''.join(pieces[1:])
+            pieces = xml_trim.rpartition('SpeFormat>')
+            xml_trim = ''.join(pieces[:-1])
+            if xml_trim == '':
+                print(("WARNING: XML footer was not partitioned correctly\n" +
+                       "and may need to be reformatted."), file=sys.stderr)
+                xml = xml_orig
+            else:
+                xml = xml_trim
+            self.footer_metadata = xml
         return None
+
 
     def _get_start_offset(self):
         """
@@ -237,14 +260,15 @@ class File(object):
         bytes_per_frame = int(pixels_per_frame * (bits_per_pixel / File._bits_per_byte))
         return bytes_per_frame
 
-    def _get_bytes_per_metadata_elt(self):
+    @staticmethod
+    def _get_bytes_per_metadata_elt():
         """
         Return number of bytes per element of metadata.
         """
         # TODO: use footer metadata if it exists.
         # From SPE 3.0 File Format Specification, Ch 1 (with clarifications):
         # bytes_per_metadata_elt = 8 bytes per metadata element
-        #   metadata element includes time stamps, frame tracking number, etc with 8 bytes each.
+        # metadata element includes time stamps, frame tracking number, etc with 8 bytes each.
         bits_per_metadata_elt = File._ntype_to_bits[File._metadata_ntype]
         bytes_per_metadata_elt = int(bits_per_metadata_elt / File._bits_per_byte)
         return bytes_per_metadata_elt
@@ -266,7 +290,7 @@ class File(object):
         bytes_per_metadata_set = self._get_bytes_per_metadata_set()
         bytes_per_stride = int(bytes_per_frame + bytes_per_metadata_set)
         return bytes_per_stride
-        
+
     def get_num_frames(self):
         """
         Return number of frames currently in an SPE file.
@@ -284,7 +308,8 @@ class File(object):
         eof_offset = self._get_eof_offset()
         num_frames = int((eof_offset - start_offset) // bytes_per_stride)
         return num_frames
-                
+
+    # noinspection PyShadowingNames
     def get_frame(self, frame_idx):
         """
         Return a frame and per-frame metadata from the file.
@@ -328,21 +353,21 @@ class File(object):
         mftracknum_offset = mtsexpend_offset + bytes_per_metadata_elt
         metadata = {}
         mtsexpstart = self._read_at(mtsexpstart_offset, 1, File._metadata_ntype)[0]
-        mtsexpend   = self._read_at(mtsexpend_offset, 1, File._metadata_ntype)[0]
-        mftracknum  = self._read_at(mftracknum_offset, 1, File._metadata_ntype)[0]
+        mtsexpend = self._read_at(mtsexpend_offset, 1, File._metadata_ntype)[0]
+        mftracknum = self._read_at(mftracknum_offset, 1, File._metadata_ntype)[0]
         metadata["time_stamp_exposure_started"] = mtsexpstart
         metadata["time_stamp_exposure_ended"] = mtsexpend
         metadata["frame_tracking_number"] = mftracknum
-        return (frame, metadata)
+        return frame, metadata
 
     # # TODO: make generator. for now use get_frame
     # def get_frames(self, frame_idx_list):
-    #     """
-    #     Yield a frame and per-frame metadata from the file.
-    #     Return a frame and per-frame metadata from the file.
-    #     Frame is returned as a numpy 2D array.
-    #     Time stamp metadata is returned as Python datetime object.
-    #     frame_list argument is python indexed: 0 is first frame.
+    # """
+    # Yield a frame and per-frame metadata from the file.
+    # Return a frame and per-frame metadata from the file.
+    # Frame is returned as a numpy 2D array.
+    # Time stamp metadata is returned as Python datetime object.
+    # frame_list argument is python indexed: 0 is first frame.
     #     """
     #     # get_num_frames()
     #     # self.current_frame_idx
@@ -357,6 +382,8 @@ class File(object):
         self._fid.close()
         return None
 
+
+# noinspection PyShadowingNames
 def main(args):
     """
     Read a numbered frame from the SPE file.
@@ -365,29 +392,30 @@ def main(args):
     fid = File(args.fname)
     (frame, metadata) = fid.get_frame(args.frame_idx)
     fid.close()
-    return (frame, metadata)
-            
+    return frame, metadata
+
+
 if __name__ == "__main__":
     # TODO: have defaults for metadata
     fname_default = "test_yes_footer.spe"
     frame_idx_default = -1
-    parser = argparse.ArgumentParser(description="Read a SPE file and return ndarray frame and dict metadata variables.")
+    parser = argparse.ArgumentParser(
+        description="Read a SPE file and return ndarray frame and dict metadata variables.")
     parser.add_argument("--fname",
                         default=fname_default,
                         help=("Path to SPE file. "
-                              +"Default: {default}".format(default=fname_default)))
+                              + "Default: {default}".format(default=fname_default)))
     parser.add_argument("--frame_idx",
                         default=frame_idx_default,
                         help=("Frame index to read in. First frame is 0. Last frame is -1. "
-                              +"Default: {default}".format(default=frame_idx_default)))
+                              + "Default: {default}".format(default=frame_idx_default)))
     parser.add_argument("--verbose",
                         "-v",
                         action='store_true',
-                        help=("Print 'INFO:' messages to stdout."))
+                        help="Print 'INFO:' messages to stdout.")
     args = parser.parse_args()
     if args.verbose:
         print("INFO: Arguments:")
         for arg in args.__dict__:
             print(arg, args.__dict__[arg])
     (frame, metadata) = main(args)
-    
